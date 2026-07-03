@@ -27,7 +27,8 @@ from app.models import ConversationTurn
 logger = structlog.get_logger(__name__)
 
 _OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-_GENERATION_TIMEOUT_SECONDS = 4.0
+_CONNECT_TIMEOUT_SECONDS = 8.0   # HTTP connect + TLS + OpenAI TTFT budget
+_PER_CHUNK_TIMEOUT_SECONDS = 4.0  # max gap between consecutive SSE chunks
 _FALLBACK_REPLY = "Sorry, ek moment ruko."
 
 # Split on sentence-ending punctuation, including Hindi's poorna viram (।).
@@ -48,7 +49,7 @@ async def _raw_delta_stream(
     Chat Completions endpoint returns, stopping cleanly on the `[DONE]`
     sentinel line.
     """
-    timeout = httpx.Timeout(connect=3.0, read=None, write=5.0, pool=5.0)
+    timeout = httpx.Timeout(connect=3.0, read=12.0, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST", _OPENAI_CHAT_URL, headers=headers, json=payload
@@ -105,22 +106,20 @@ async def stream_reply(
     }
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _GENERATION_TIMEOUT_SECONDS
     buffer = ""
     got_any = False
 
     raw_iter = _raw_delta_stream(payload, headers).__aiter__()
     while True:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            logger.warning("openai_llm.timeout", call_sid=call_sid)
-            break
+        # First chunk: large budget covers TCP+TLS+OpenAI TTFT.
+        # Subsequent chunks: tighter budget — model is already streaming.
+        chunk_timeout = _CONNECT_TIMEOUT_SECONDS if not got_any else _PER_CHUNK_TIMEOUT_SECONDS
         try:
-            text = await asyncio.wait_for(raw_iter.__anext__(), timeout=remaining)
+            text = await asyncio.wait_for(raw_iter.__anext__(), timeout=chunk_timeout)
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError:
-            logger.warning("openai_llm.timeout", call_sid=call_sid)
+            logger.warning("openai_llm.timeout", call_sid=call_sid, got_any=got_any)
             break
         except asyncio.CancelledError:
             raise
