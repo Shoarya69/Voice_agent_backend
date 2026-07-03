@@ -63,7 +63,8 @@ async def fetch_agent_config(agent_id: str) -> AgentConfig:
             response = await client.get(url, headers=_auth_headers())
             response.raise_for_status()
             data: dict[str, Any] = response.json()
-            return AgentConfig(agent_id=agent_id, **data)
+            data.setdefault("agent_id", agent_id)
+            return AgentConfig(**data)
 
     try:
         config = await retry_async(
