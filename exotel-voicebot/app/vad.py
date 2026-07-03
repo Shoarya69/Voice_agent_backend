@@ -16,7 +16,7 @@ FrameState = Literal["speech", "silence", "end_of_utterance"]
 # Default aggressiveness: 0 (least aggressive, most permissive) to 3
 # (most aggressive at filtering out non-speech). Voicebots benefit from a
 # fairly aggressive mode to avoid line-noise triggering false speech.
-_DEFAULT_VAD_MODE = 3
+_DEFAULT_VAD_MODE = 1
 
 # How many ms of continuous silence after speech has started before we
 # consider the utterance finished.
