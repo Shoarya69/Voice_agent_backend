@@ -20,7 +20,7 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 
-from app.audio_utils import mulaw_to_pcm16
+from app.audio_utils import mulaw_to_pcm16, rms_level
 from app.models import (
     AgentConfig,
     ConversationTurn,
@@ -41,6 +41,25 @@ _FRAME_MS = 20
 _MULAW_FRAME_BYTES = 160
 _PREBUFFER_FRAMES = 5  # ~100ms of pre-speech padding kept for STT accuracy
 _MAX_UTTERANCE_SECONDS = 20
+
+# --- Barge-in / echo-suppression tuning -----------------------------------
+# Outbound TTS audio can leak back into the inbound audio path (acoustic
+# echo on real calls, or full-duplex mic/speaker crosstalk in local
+# testing). Without suppression, the bot's own voice gets detected as the
+# caller interrupting, causing an infinite cancel/retry loop. Three
+# independent guards are combined before a barge-in is allowed to fire:
+#
+#   1. Echo window: ignore inbound frames for a short period after each
+#      outbound audio frame is sent.
+#   2. RMS energy threshold: real speech is typically louder than leaked/
+#      attenuated echo; frames below this are ignored for barge-in purposes.
+#   3. Sustained-speech confirmation: require several consecutive frames
+#      that pass both of the above before treating it as genuine barge-in
+#      (a few stray loud frames are not enough).
+_ECHO_SUPPRESSION_SECONDS = 0.25
+_BARGE_IN_RMS_THRESHOLD = 700.0
+_BARGE_IN_CONFIRM_MS = 300
+_BARGE_IN_CONFIRM_FRAMES = max(1, _BARGE_IN_CONFIRM_MS // _FRAME_MS)
 
 
 class Metrics:
@@ -88,6 +107,17 @@ class SessionState:
     active: bool = True
     turn_start_monotonic: float | None = None
     turn_latency_recorded: bool = False
+    # Monotonic timestamp of the last outbound TTS audio frame sent to
+    # Exotel. Used for echo-suppression: inbound frames arriving shortly
+    # after outbound audio are more likely to be leaked/echoed bot audio
+    # than genuine caller speech. Defaults to 0.0 (far in the past) so no
+    # suppression applies before the bot has ever spoken.
+    last_bot_audio_monotonic: float = 0.0
+    # Consecutive inbound frames that have passed both the echo-suppression
+    # window and the RMS threshold while the bot is speaking. Used to
+    # require sustained speech (not just a stray loud frame) before firing
+    # a real barge-in.
+    barge_in_speech_frames: int = 0
 
 
 async def handle_exotel_websocket(websocket: WebSocket) -> None:
@@ -183,11 +213,60 @@ async def _handle_media(session: SessionState, event: MediaEvent, log: Any) -> N
     if not pcm_frame:
         return
 
+    rms = rms_level(pcm_frame)
     state = session.vad.process_frame(pcm_frame)
 
+    log.debug(
+        "vad.debug",
+        rms=round(rms, 1),
+        state=state,
+        vad_speaking=session.vad.is_speaking,
+        bot_speaking=session.is_bot_speaking,
+        active=session.active,
+    )
+
     # Barge-in: caller starts talking while the bot is mid-TTS playback.
+    # Outbound TTS audio can leak back into the inbound path (real-call
+    # acoustic echo, or full-duplex crosstalk in local testing), which the
+    # VAD alone cannot distinguish from genuine speech. Three guards are
+    # combined: an echo-suppression window right after outbound audio, an
+    # RMS energy floor, and a sustained-speech frame count - all three must
+    # hold before a barge-in is allowed to fire.
     if session.is_bot_speaking and state in ("speech", "end_of_utterance"):
-        await _handle_barge_in(session, log)
+        since_bot_audio = time.monotonic() - session.last_bot_audio_monotonic
+        if since_bot_audio < _ECHO_SUPPRESSION_SECONDS:
+            log.debug(
+                "barge_in.suppressed_echo_window",
+                rms=round(rms, 1),
+                state=state,
+                since_bot_audio_s=round(since_bot_audio, 3),
+            )
+            session.barge_in_speech_frames = 0
+        elif rms < _BARGE_IN_RMS_THRESHOLD:
+            log.debug(
+                "barge_in.suppressed_low_rms",
+                rms=round(rms, 1),
+                state=state,
+                threshold=_BARGE_IN_RMS_THRESHOLD,
+            )
+            session.barge_in_speech_frames = 0
+        else:
+            session.barge_in_speech_frames += 1
+            speech_ms = session.barge_in_speech_frames * _FRAME_MS
+            if session.barge_in_speech_frames >= _BARGE_IN_CONFIRM_FRAMES:
+                log.warning(
+                    "barge_in.triggered",
+                    reason="sustained_speech_during_bot_playback",
+                    rms=round(rms, 1),
+                    state=state,
+                    speech_ms=speech_ms,
+                    since_bot_audio_s=round(since_bot_audio, 3),
+                    turn_task_active=bool(session.turn_task and not session.turn_task.done()),
+                )
+                session.barge_in_speech_frames = 0
+                await _handle_barge_in(session, log)
+    else:
+        session.barge_in_speech_frames = 0
 
     if state == "speech":
         if not session.audio_buffer:
@@ -255,6 +334,15 @@ async def _process_turn(session: SessionState, utterance_pcm: bytes, log: Any) -
             call_sid=session.call_sid,
         )
         if not transcript:
+            return
+
+        # ElevenLabs Scribe returns non-speech sounds in square brackets,
+        # e.g. "[silence]", "[phone ringing]", "[हँसने की आवाज़]".
+        # These are not real utterances — skip them to avoid wasting LLM calls
+        # and generating bot responses to background noise.
+        stripped = transcript.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            log.info("turn.noise_skipped", transcript=stripped)
             return
 
         log.info("turn.transcript", transcript=transcript)
@@ -328,12 +416,28 @@ async def _send_mulaw_audio(session: SessionState, mulaw_bytes: bytes) -> None:
         if not session.active:
             return
         payload = base64.b64encode(frame).decode("ascii")
-        await session.websocket.send_json(
-            {
-                "event": "media",
-                "stream_sid": session.stream_sid,
-                "media": {"payload": payload},
-            }
+        try:
+            await session.websocket.send_json(
+                {
+                    "event": "media",
+                    "stream_sid": session.stream_sid,
+                    "media": {"payload": payload},
+                }
+            )
+        except Exception:
+            # The socket is gone (caller hung up / disconnect race with an
+            # in-flight turn task). Mark the session inactive immediately so
+            # every other concurrent send/receive path stops instead of
+            # retrying against a dead connection.
+            session.active = False
+            raise
+
+        session.last_bot_audio_monotonic = time.monotonic()
+        logger.debug(
+            "tts.frame_sent",
+            call_sid=session.call_sid,
+            bytes=len(frame),
+            bot_speaking=session.is_bot_speaking,
         )
         if not session.turn_latency_recorded and session.turn_start_monotonic is not None:
             session.turn_latency_recorded = True

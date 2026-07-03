@@ -20,11 +20,13 @@ _DEFAULT_VAD_MODE = 1
 
 # How many ms of continuous silence after speech has started before we
 # consider the utterance finished.
-_DEFAULT_END_SILENCE_MS = 500
+_DEFAULT_END_SILENCE_MS = 700
 
 # How many ms of continuous speech are required before we consider the
 # caller to have actually started talking (helps ignore blips).
-_DEFAULT_START_SPEECH_MS = 60
+# Kept low (40ms = 2 frames) so real caller speech is picked up quickly
+# on compressed Exotel mu-law audio, which has lower energy than raw PCM.
+_DEFAULT_START_SPEECH_MS = 40
 
 
 class VADProcessor:
