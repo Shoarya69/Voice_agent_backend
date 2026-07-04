@@ -15,3 +15,5 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+talk_to_vps_websocket.py
+talk_to_voicebot.py
