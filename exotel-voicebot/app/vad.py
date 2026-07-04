@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from typing import Literal
 
+import structlog
 import webrtcvad
+
+logger = structlog.get_logger(__name__)
 
 FrameState = Literal["speech", "silence", "end_of_utterance"]
 
@@ -82,8 +85,20 @@ class VADProcessor:
         """
         try:
             is_speech = self._vad.is_speech(pcm_20ms, self._sample_rate)
-        except Exception:
-            # Malformed/short frame (e.g. last partial chunk) - treat as silence.
+        except Exception as exc:  # noqa: BLE001
+            # webrtcvad.is_speech() requires the buffer to be EXACTLY
+            # 10/20/30ms of audio at `self._sample_rate` and raises for any
+            # other length. This has previously masked a real upstream bug
+            # (Exotel media events not being split into fixed 20ms
+            # sub-frames before reaching the VAD), silently turning every
+            # frame into "silence" for the whole call. Log it so a
+            # frame-size mismatch is immediately visible instead of hidden.
+            logger.warning(
+                "vad.invalid_frame",
+                frame_bytes=len(pcm_20ms),
+                sample_rate=self._sample_rate,
+                error=str(exc),
+            )
             is_speech = False
 
         if is_speech:

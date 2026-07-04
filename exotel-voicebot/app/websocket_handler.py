@@ -20,7 +20,7 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 
-from app.audio_utils import mulaw_to_pcm16, rms_level
+from app.audio_utils import chunk_audio, mulaw_to_pcm16, rms_level
 from app.models import (
     AgentConfig,
     ConversationTurn,
@@ -39,6 +39,15 @@ _event_adapter: TypeAdapter[ExotelEvent] = TypeAdapter(ExotelEvent)
 # 8kHz, 16-bit mono => 160 bytes of PCM per 20ms frame; mu-law is half that.
 _FRAME_MS = 20
 _MULAW_FRAME_BYTES = 160
+# 8kHz, 16-bit mono PCM => 320 bytes per 20ms frame. webrtcvad.is_speech()
+# strictly requires buffers of exactly 10/20/30ms at the given sample rate
+# and raises otherwise. Exotel's `media` events are NOT guaranteed to carry
+# exactly one 20ms frame each (the applet's configured buffer/chunk size can
+# be larger, e.g. 100ms), so a single event's payload must be split into
+# fixed 20ms sub-frames before being handed to the VAD - otherwise
+# is_speech() throws on every call, which was silently swallowed as
+# "silence", permanently masking all real caller speech.
+_PCM_FRAME_BYTES = 320
 _PREBUFFER_FRAMES = 5  # ~100ms of pre-speech padding kept for STT accuracy
 _MAX_UTTERANCE_SECONDS = 20
 
@@ -192,7 +201,11 @@ async def _handle_start(session: SessionState, event: StartEvent) -> None:
     session.config = await lovable_api.fetch_agent_config(session.agent_id)
 
     if session.config.first_message:
-        await _speak(session, session.config.first_message, log)
+        session.is_bot_speaking = True
+        try:
+            await _speak(session, session.config.first_message, log)
+        finally:
+            session.is_bot_speaking = False
         session.history.append(
             ConversationTurn(role="assistant", text=session.config.first_message)
         )
@@ -209,10 +222,24 @@ async def _handle_media(session: SessionState, event: MediaEvent, log: Any) -> N
         log.warning("websocket.bad_media_payload", error=str(exc))
         return
 
-    pcm_frame = mulaw_to_pcm16(mulaw_bytes)
-    if not pcm_frame:
+    pcm_audio = mulaw_to_pcm16(mulaw_bytes)
+    if not pcm_audio:
         return
 
+    # A single Exotel `media` event is NOT guaranteed to carry exactly one
+    # 20ms frame - it may batch several frames together depending on the
+    # applet's configured buffer size. Split into fixed 20ms PCM sub-frames
+    # so webrtcvad always receives a validly-sized buffer; feeding it
+    # arbitrary lengths makes `is_speech()` raise on every call, which was
+    # silently treated as permanent "silence" and masked all caller speech.
+    for pcm_frame in chunk_audio(pcm_audio, chunk_ms=_FRAME_MS, sample_rate=8000):
+        if len(pcm_frame) != _PCM_FRAME_BYTES:
+            continue  # drop a short trailing remainder; not a full 20ms frame
+        await _process_inbound_frame(session, pcm_frame, log)
+
+
+async def _process_inbound_frame(session: SessionState, pcm_frame: bytes, log: Any) -> None:
+    """Run VAD/barge-in/buffering logic for exactly one 20ms PCM frame."""
     rms = rms_level(pcm_frame)
     state = session.vad.process_frame(pcm_frame)
 
