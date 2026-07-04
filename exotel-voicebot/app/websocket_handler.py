@@ -386,17 +386,34 @@ async def _speak(session: SessionState, text: str, log: Any) -> None:
         return
 
     sent_any = False
+    # ElevenLabs' HTTP stream delivers arbitrary-sized network chunks that do
+    # NOT align to our 160-byte (20ms) Exotel frame size. Accumulate raw
+    # mu-law bytes here and only hand off exact 160-byte frames downstream -
+    # otherwise each network chunk's leftover tail becomes its own
+    # short/misaligned "frame", which is what was causing audible
+    # noise/static on real Exotel calls despite clean standalone playback.
+    pending = bytearray()
     try:
         async for mulaw_chunk in elevenlabs_tts.stream_tts(
             text, voice_id=session.config.voice_id, call_sid=session.call_sid
         ):
             if not session.active:
                 return
-            sent_any = True
-            await _send_mulaw_audio(session, mulaw_chunk)
+            pending.extend(mulaw_chunk)
+            while len(pending) >= _MULAW_FRAME_BYTES:
+                frame = bytes(pending[:_MULAW_FRAME_BYTES])
+                del pending[:_MULAW_FRAME_BYTES]
+                sent_any = True
+                await _send_mulaw_audio(session, frame)
 
         if not session.active:
             return
+
+        # Flush the trailing partial frame (< 20ms) so the last syllable of
+        # this sentence isn't dropped.
+        if pending:
+            sent_any = True
+            await _send_mulaw_audio(session, bytes(pending))
 
         if not sent_any:
             log.warning("tts.no_audio_produced", text_len=len(text))
