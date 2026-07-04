@@ -23,7 +23,10 @@ _MODEL_ID = "eleven_multilingual_v2"
 _OUTPUT_FORMAT = "ulaw_8000"
 # Maximum latency optimization (0-4): trades a little audio quality/normalization
 # for the lowest possible time-to-first-byte, which matters most for a live call.
-_OPTIMIZE_STREAMING_LATENCY = 4
+# Temporarily lowered from 4 -> 0 while diagnosing reported noise/static on real
+# Exotel calls (level 4's compression artifacts are a suspect since the same
+# audio plays clean through our own test client but not through Exotel).
+_OPTIMIZE_STREAMING_LATENCY = 0
 _CONNECT_TIMEOUT_SECONDS = 3.0
 _TOTAL_TIMEOUT_SECONDS = 10.0
 _MAX_CONNECT_RETRIES = 1
